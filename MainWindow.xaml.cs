@@ -9,6 +9,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using Windows.Media.Control;
 using Microsoft.Win32;
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using Drawing = System.Drawing;
 using Forms = System.Windows.Forms;
@@ -41,10 +42,13 @@ public partial class MainWindow : Window
     private const double ExpandedWindowHeight = 170;
     private const double MinimumBarScale = 0.08;
     private const double MaximumBarOpacity = 0.92;
+    private static readonly Guid PcmSubFormat = new("00000001-0000-0010-8000-00aa00389b71");
+    private static readonly Guid IeeeFloatSubFormat = new("00000003-0000-0010-8000-00aa00389b71");
 
     private readonly System.Windows.Threading.DispatcherTimer _avoidTimer;
     private readonly System.Windows.Threading.DispatcherTimer _metadataTimer;
     private readonly System.Windows.Threading.DispatcherTimer _desktopModeTimer;
+    private readonly System.Windows.Threading.DispatcherTimer _audioDeviceTimer;
     private readonly List<Border> _barFills = [];
     private readonly List<ScaleTransform> _barScales = [];
     private readonly Forms.ContextMenuStrip _trayMenu;
@@ -59,6 +63,7 @@ public partial class MainWindow : Window
     private readonly object _gate = new();
 
     private WasapiLoopbackCapture? _capture;
+    private readonly MMDeviceEnumerator _deviceEnumerator = new();
     private GlobalSystemMediaTransportControlsSessionManager? _sessionManager;
     private float _currentPeak;
     private float _smoothedPeak;
@@ -71,6 +76,7 @@ public partial class MainWindow : Window
     private bool _isDesktopMode;
     private bool _isUpdatingMetadata;
     private IntPtr _windowHandle;
+    private string? _currentAudioDeviceId;
     private string _displayedArtist = "";
     private string _displayedTitle = "";
     private TimeSpan _lastRenderTime;
@@ -97,6 +103,12 @@ public partial class MainWindow : Window
             Interval = TimeSpan.FromMilliseconds(800)
         };
         _desktopModeTimer.Tick += DesktopModeTimer_Tick;
+
+        _audioDeviceTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(1)
+        };
+        _audioDeviceTimer.Tick += AudioDeviceTimer_Tick;
 
         (_trayMenu, _trayIcon) = CreateTrayIcon();
 
@@ -268,18 +280,111 @@ public partial class MainWindow : Window
 
         try
         {
-            _capture = new WasapiLoopbackCapture();
-            _capture.DataAvailable += Capture_DataAvailable;
-            _capture.StartRecording();
+            StartAudioCapture();
             CompositionTarget.Rendering += CompositionTarget_Rendering;
             _metadataTimer.Start();
             _desktopModeTimer.Start();
+            _audioDeviceTimer.Start();
             _ = UpdateMediaMetadataAsync();
         }
         catch (Exception ex)
         {
             Title = $"Không thể bắt âm thanh: {ex.Message}";
         }
+    }
+
+    private void AudioDeviceTimer_Tick(object? sender, EventArgs e)
+    {
+        var defaultDeviceId = GetDefaultAudioDeviceId();
+        if (!string.Equals(defaultDeviceId, _currentAudioDeviceId, StringComparison.OrdinalIgnoreCase))
+        {
+            RestartAudioCapture();
+        }
+    }
+
+    private void StartAudioCapture()
+    {
+        var device = _deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+        _currentAudioDeviceId = device.ID;
+        _capture = new WasapiLoopbackCapture(device);
+        _capture.DataAvailable += Capture_DataAvailable;
+        _capture.RecordingStopped += Capture_RecordingStopped;
+        _capture.StartRecording();
+    }
+
+    private void RestartAudioCapture()
+    {
+        StopAudioCapture();
+        ClearAudioLevels();
+
+        try
+        {
+            StartAudioCapture();
+            Title = "Audio Visualizer";
+        }
+        catch (Exception ex)
+        {
+            _currentAudioDeviceId = null;
+            Title = $"Khong the bat am thanh: {ex.Message}";
+        }
+    }
+
+    private void StopAudioCapture()
+    {
+        if (_capture is null)
+        {
+            return;
+        }
+
+        _capture.DataAvailable -= Capture_DataAvailable;
+        _capture.RecordingStopped -= Capture_RecordingStopped;
+
+        try
+        {
+            _capture.StopRecording();
+        }
+        catch
+        {
+            // Some devices disappear before WASAPI can stop cleanly.
+        }
+
+        _capture.Dispose();
+        _capture = null;
+    }
+
+    private string? GetDefaultAudioDeviceId()
+    {
+        try
+        {
+            return _deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia).ID;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void Capture_RecordingStopped(object? sender, StoppedEventArgs e)
+    {
+        if (e.Exception is not null)
+        {
+            Dispatcher.BeginInvoke(RestartAudioCapture);
+        }
+    }
+
+    private void ClearAudioLevels()
+    {
+        lock (_gate)
+        {
+            Array.Clear(_currentBands);
+            _currentPeak = 0f;
+        }
+
+        Array.Clear(_analysisBands);
+        Array.Clear(_analysisSamples);
+        Array.Clear(_renderBands);
+        Array.Clear(_smoothedBands);
+        _smoothedPeak = 0f;
     }
 
     private void Capture_DataAvailable(object? sender, WaveInEventArgs e)
@@ -964,13 +1069,43 @@ public partial class MainWindow : Window
 
     private static float ReadSample(byte[] buffer, int offset, WaveFormat format)
     {
+        if (format is WaveFormatExtensible extensible)
+        {
+            if (extensible.SubFormat == IeeeFloatSubFormat && format.BitsPerSample == 32)
+            {
+                return Math.Clamp(BitConverter.ToSingle(buffer, offset), -1f, 1f);
+            }
+
+            if (extensible.SubFormat == PcmSubFormat)
+            {
+                return ReadPcmSample(buffer, offset, format.BitsPerSample);
+            }
+        }
+
         return format.Encoding switch
         {
             WaveFormatEncoding.IeeeFloat when format.BitsPerSample == 32 => Math.Clamp(BitConverter.ToSingle(buffer, offset), -1f, 1f),
-            WaveFormatEncoding.Pcm when format.BitsPerSample == 16 => BitConverter.ToInt16(buffer, offset) / 32768f,
-            WaveFormatEncoding.Pcm when format.BitsPerSample == 8 => (buffer[offset] - 128) / 128f,
+            WaveFormatEncoding.Pcm => ReadPcmSample(buffer, offset, format.BitsPerSample),
             _ => 0f
         };
+    }
+
+    private static float ReadPcmSample(byte[] buffer, int offset, int bitsPerSample)
+    {
+        return bitsPerSample switch
+        {
+            8 => (buffer[offset] - 128) / 128f,
+            16 => BitConverter.ToInt16(buffer, offset) / 32768f,
+            24 => ReadInt24(buffer, offset) / 8388608f,
+            32 => BitConverter.ToInt32(buffer, offset) / 2147483648f,
+            _ => 0f
+        };
+    }
+
+    private static int ReadInt24(byte[] buffer, int offset)
+    {
+        var value = buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+        return (value & 0x800000) != 0 ? value | unchecked((int)0xff000000) : value;
     }
 
     private void AnalyzeSpectrum(float[] samples, int sampleCount, int sampleRate, float[] bands)
@@ -1142,10 +1277,11 @@ public partial class MainWindow : Window
         _avoidTimer.Stop();
         _metadataTimer.Stop();
         _desktopModeTimer.Stop();
+        _audioDeviceTimer.Stop();
         SystemEvents.DisplaySettingsChanged -= SystemEvents_DisplaySettingsChanged;
         SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
-        _capture?.StopRecording();
-        _capture?.Dispose();
+        StopAudioCapture();
+        _deviceEnumerator.Dispose();
     }
 
     [DllImport("user32.dll")]
