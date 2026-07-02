@@ -1,0 +1,79 @@
+<Window x:Class="AudioVisualizer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d"
+        Title="Audio Visualizer"
+        Width="280"
+        Height="92"
+        Icon="Assets/tray-icon.ico"
+        MinWidth="280"
+        MaxWidth="280"
+        MinHeight="92"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ResizeMode="NoResize"
+        ShowActivated="False"
+        ShowInTaskbar="False"
+        SizeToContent="Manual"
+        Topmost="True"
+        WindowStartupLocation="Manual"
+        WindowStyle="None">
+    <Grid Background="Transparent"
+          MouseEnter="Window_MouseEnter">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="92"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <UniformGrid x:Name="SpectrumGrid"
+                     Grid.Row="0"
+                     Rows="1"
+                     Columns="18"
+                     Height="78"
+                     Margin="14,8,14,0"
+                     VerticalAlignment="Bottom"/>
+
+        <StackPanel x:Name="MediaTextPanel"
+                    Grid.Row="1"
+                    Margin="14,0,14,10"
+                    VerticalAlignment="Top"
+                    Visibility="Collapsed">
+            <TextBlock x:Name="ArtistText"
+                       FontFamily="Segoe UI"
+                       FontSize="28"
+                       FontWeight="SemiBold"
+                       Foreground="White"
+                       LineHeight="30"
+                       TextTrimming="CharacterEllipsis"
+                       Visibility="Collapsed">
+                <TextBlock.Effect>
+                    <DropShadowEffect BlurRadius="5"
+                                      Color="#AA000000"
+                                      Direction="270"
+                                      Opacity="0.72"
+                                      ShadowDepth="1"/>
+                </TextBlock.Effect>
+            </TextBlock>
+
+            <TextBlock x:Name="TitleText"
+                       Margin="1,-1,0,0"
+                       FontFamily="Segoe UI"
+                       FontSize="15"
+                       FontWeight="Regular"
+                       Foreground="#F2FFFFFF"
+                       LineHeight="18"
+                       TextTrimming="CharacterEllipsis"
+                       Visibility="Collapsed">
+                <TextBlock.Effect>
+                    <DropShadowEffect BlurRadius="4"
+                                      Color="#AA000000"
+                                      Direction="270"
+                                      Opacity="0.7"
+                                      ShadowDepth="1"/>
+                </TextBlock.Effect>
+            </TextBlock>
+        </StackPanel>
+    </Grid>
+</Window>
