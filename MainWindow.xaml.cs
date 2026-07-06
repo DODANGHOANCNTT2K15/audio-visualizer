@@ -42,6 +42,10 @@ public partial class MainWindow : Window
     private const double ExpandedWindowHeight = 170;
     private const double MinimumBarScale = 0.08;
     private const double MaximumBarOpacity = 0.92;
+    private const double BrightBackgroundLuminance = 0.62;
+    private const double DarkBackgroundLuminance = 0.48;
+    private const int BackgroundSampleRadiusPx = 6;
+    private const int BackgroundSampleOffsetPx = 18;
     private static readonly Guid PcmSubFormat = new("00000001-0000-0010-8000-00aa00389b71");
     private static readonly Guid IeeeFloatSubFormat = new("00000003-0000-0010-8000-00aa00389b71");
 
@@ -49,6 +53,7 @@ public partial class MainWindow : Window
     private readonly System.Windows.Threading.DispatcherTimer _metadataTimer;
     private readonly System.Windows.Threading.DispatcherTimer _desktopModeTimer;
     private readonly System.Windows.Threading.DispatcherTimer _audioDeviceTimer;
+    private readonly System.Windows.Threading.DispatcherTimer _backgroundSamplerTimer;
     private readonly List<Border> _barFills = [];
     private readonly List<ScaleTransform> _barScales = [];
     private readonly Forms.ContextMenuStrip _trayMenu;
@@ -75,10 +80,12 @@ public partial class MainWindow : Window
     private bool _isAvoidingCursor;
     private bool _isDesktopMode;
     private bool _isUpdatingMetadata;
+    private bool _usesDarkForeground;
     private IntPtr _windowHandle;
     private string? _currentAudioDeviceId;
     private string _displayedArtist = "";
     private string _displayedTitle = "";
+    private WpfColor _adaptiveForegroundColor = Colors.White;
     private TimeSpan _lastRenderTime;
 
     public MainWindow()
@@ -109,6 +116,12 @@ public partial class MainWindow : Window
             Interval = TimeSpan.FromSeconds(1)
         };
         _audioDeviceTimer.Tick += AudioDeviceTimer_Tick;
+
+        _backgroundSamplerTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(800)
+        };
+        _backgroundSamplerTimer.Tick += BackgroundSamplerTimer_Tick;
 
         (_trayMenu, _trayIcon) = CreateTrayIcon();
 
@@ -263,10 +276,29 @@ public partial class MainWindow : Window
     private void MainWindow_SourceInitialized(object? sender, EventArgs e)
     {
         _windowHandle = new WindowInteropHelper(this).Handle;
+        HideWindowFromAltTab();
+    }
+
+    private void HideWindowFromAltTab()
+    {
+        if (_windowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var exStyle = GetWindowLongPtr(_windowHandle, GwlExStyle).ToInt64();
+        exStyle |= WsExToolWindow;
+        exStyle &= ~WsExAppWindow;
+        SetWindowLongPtr(_windowHandle, GwlExStyle, new IntPtr(exStyle));
     }
 
     private void RefreshSpectrumBarStyle()
     {
+        var textBrush = new SolidColorBrush(_adaptiveForegroundColor);
+        textBrush.Freeze();
+        ArtistText.Foreground = textBrush;
+        TitleText.Foreground = textBrush;
+
         for (int i = 0; i < _barFills.Count; i++)
         {
             _barFills[i].Background = GetBandBrush(i);
@@ -285,11 +317,152 @@ public partial class MainWindow : Window
             _metadataTimer.Start();
             _desktopModeTimer.Start();
             _audioDeviceTimer.Start();
+            UpdateAdaptiveForegroundForBackground();
+            _backgroundSamplerTimer.Start();
             _ = UpdateMediaMetadataAsync();
         }
         catch (Exception ex)
         {
             Title = $"Không thể bắt âm thanh: {ex.Message}";
+        }
+    }
+
+    private void BackgroundSamplerTimer_Tick(object? sender, EventArgs e)
+    {
+        UpdateAdaptiveForegroundForBackground();
+    }
+
+    private void UpdateAdaptiveForegroundForBackground()
+    {
+        if (SystemParameters.HighContrast || !TryGetBackgroundLuminance(out var luminance))
+        {
+            return;
+        }
+
+        var shouldUseDarkForeground = _usesDarkForeground
+            ? luminance > DarkBackgroundLuminance
+            : luminance > BrightBackgroundLuminance;
+
+        if (shouldUseDarkForeground == _usesDarkForeground)
+        {
+            return;
+        }
+
+        _usesDarkForeground = shouldUseDarkForeground;
+        _adaptiveForegroundColor = _usesDarkForeground ? Colors.Black : Colors.White;
+        RefreshSpectrumBarStyle();
+    }
+
+    private bool TryGetBackgroundLuminance(out double luminance)
+    {
+        luminance = 0;
+        if (!TryGetWindowBoundsPx(out var bounds))
+        {
+            return false;
+        }
+
+        var total = 0d;
+        var count = 0;
+        foreach (var point in GetBackgroundSamplePoints(bounds))
+        {
+            if (TrySampleScreenLuminance(point, out var pointLuminance))
+            {
+                total += pointLuminance;
+                count++;
+            }
+        }
+
+        if (count == 0)
+        {
+            return false;
+        }
+
+        luminance = total / count;
+        return true;
+    }
+
+    private bool TryGetWindowBoundsPx(out Drawing.Rectangle bounds)
+    {
+        bounds = Drawing.Rectangle.Empty;
+        if (ActualWidth <= 0 || ActualHeight <= 0)
+        {
+            return false;
+        }
+
+        var transform = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice ?? Matrix.Identity;
+        var left = (int)Math.Round(Left * transform.M11);
+        var top = (int)Math.Round(Top * transform.M22);
+        var width = Math.Max(1, (int)Math.Round(ActualWidth * transform.M11));
+        var height = Math.Max(1, (int)Math.Round(ActualHeight * transform.M22));
+
+        bounds = new Drawing.Rectangle(left, top, width, height);
+        return true;
+    }
+
+    private static IEnumerable<Drawing.Point> GetBackgroundSamplePoints(Drawing.Rectangle windowBounds)
+    {
+        var screen = Forms.SystemInformation.VirtualScreen;
+        var centerX = windowBounds.Left + (windowBounds.Width / 2);
+        var centerY = windowBounds.Top + (windowBounds.Height / 2);
+        var insetX = Math.Max(8, windowBounds.Width / 5);
+        var insetY = Math.Max(8, windowBounds.Height / 4);
+
+        var candidates = new[]
+        {
+            new Drawing.Point(centerX, windowBounds.Top - BackgroundSampleOffsetPx),
+            new Drawing.Point(centerX, windowBounds.Bottom + BackgroundSampleOffsetPx),
+            new Drawing.Point(windowBounds.Left - BackgroundSampleOffsetPx, centerY),
+            new Drawing.Point(windowBounds.Right + BackgroundSampleOffsetPx, centerY),
+            new Drawing.Point(windowBounds.Left + insetX, windowBounds.Top - BackgroundSampleOffsetPx),
+            new Drawing.Point(windowBounds.Right - insetX, windowBounds.Top - BackgroundSampleOffsetPx),
+            new Drawing.Point(windowBounds.Left + insetX, windowBounds.Bottom + BackgroundSampleOffsetPx),
+            new Drawing.Point(windowBounds.Right - insetX, windowBounds.Bottom + BackgroundSampleOffsetPx),
+            new Drawing.Point(windowBounds.Left - BackgroundSampleOffsetPx, windowBounds.Top + insetY),
+            new Drawing.Point(windowBounds.Right + BackgroundSampleOffsetPx, windowBounds.Top + insetY)
+        };
+
+        foreach (var point in candidates)
+        {
+            if (screen.Contains(point))
+            {
+                yield return point;
+            }
+        }
+    }
+
+    private static bool TrySampleScreenLuminance(Drawing.Point center, out double luminance)
+    {
+        luminance = 0;
+        var diameter = (BackgroundSampleRadiusPx * 2) + 1;
+        var source = new Drawing.Point(center.X - BackgroundSampleRadiusPx, center.Y - BackgroundSampleRadiusPx);
+        var sourceBounds = new Drawing.Rectangle(source, new Drawing.Size(diameter, diameter));
+        sourceBounds.Intersect(Forms.SystemInformation.VirtualScreen);
+        if (sourceBounds.Width <= 0 || sourceBounds.Height <= 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var bitmap = new Drawing.Bitmap(sourceBounds.Width, sourceBounds.Height);
+            using var graphics = Drawing.Graphics.FromImage(bitmap);
+            graphics.CopyFromScreen(sourceBounds.Location, Drawing.Point.Empty, sourceBounds.Size);
+
+            var total = 0d;
+            for (int y = 0; y < bitmap.Height; y++)
+            {
+                for (int x = 0; x < bitmap.Width; x++)
+                {
+                    total += GetRelativeLuminance(bitmap.GetPixel(x, y));
+                }
+            }
+
+            luminance = total / (bitmap.Width * bitmap.Height);
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -1204,9 +1377,9 @@ public partial class MainWindow : Window
         return Lerp(middle, end, (t - 0.5) / 0.5);
     }
 
-    private static WpfBrush GetBandBrush(int index)
+    private WpfBrush GetBandBrush(int index)
     {
-        var brush = new SolidColorBrush(Colors.White);
+        var brush = new SolidColorBrush(_adaptiveForegroundColor);
         brush.Freeze();
         return brush;
     }
@@ -1250,6 +1423,19 @@ public partial class MainWindow : Window
         return (0.2126 * Channel(color.R)) + (0.7152 * Channel(color.G)) + (0.0722 * Channel(color.B));
     }
 
+    private static double GetRelativeLuminance(Drawing.Color color)
+    {
+        static double Channel(byte value)
+        {
+            var normalized = value / 255d;
+            return normalized <= 0.03928
+                ? normalized / 12.92
+                : Math.Pow((normalized + 0.055) / 1.055, 2.4);
+        }
+
+        return (0.2126 * Channel(color.R)) + (0.7152 * Channel(color.G)) + (0.0722 * Channel(color.B));
+    }
+
     private static WpfColor Lerp(WpfColor start, WpfColor end, double amount)
     {
         amount = Math.Clamp(amount, 0d, 1d);
@@ -1278,6 +1464,7 @@ public partial class MainWindow : Window
         _metadataTimer.Stop();
         _desktopModeTimer.Stop();
         _audioDeviceTimer.Stop();
+        _backgroundSamplerTimer.Stop();
         SystemEvents.DisplaySettingsChanged -= SystemEvents_DisplaySettingsChanged;
         SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
         StopAudioCapture();
@@ -1301,6 +1488,9 @@ public partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowTextLength(IntPtr hWnd);
